@@ -145,7 +145,11 @@ export function registerWorkflowComposeTools(server: McpServer): void {
   // 3. get_node_info
   server.tool(
     "get_node_info",
-    "Query ComfyUI's /object_info endpoint to get available node type definitions. Optionally filter by node type name (substring match). Returns node inputs, outputs, and descriptions.",
+    "Query ComfyUI's /object_info endpoint to get node type definitions. " +
+      "Returns a structural summary by default (input/output type names, no dropdown values). " +
+      "Pass verbose=true to get the FULL definition including model dropdowns — warning: this can " +
+      "be 100s of KB per Loader node (UNETLoader, CheckpointLoaderSimple, LoraLoader etc. embed " +
+      "the entire local model list).",
     {
       node_type: z
         .string()
@@ -153,10 +157,20 @@ export function registerWorkflowComposeTools(server: McpServer): void {
         .describe(
           "Filter by node class_type name (case-insensitive substring match). Omit to list all available nodes.",
         ),
+      verbose: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe(
+          "If true, return full definition including model dropdown values. " +
+            "Default false (returns structural summary only — safe for context). " +
+            "Use verbose=true only when you specifically need to enumerate model names " +
+            "for a single node, and prefer the /models/<category> REST endpoint instead.",
+        ),
     },
-    async ({ node_type }) => {
+    async ({ node_type, verbose }) => {
       try {
-        logger.info("Getting node info", { filter: node_type });
+        logger.info("Getting node info", { filter: node_type, verbose });
         const info = await getObjectInfo();
 
         let entries = Object.entries(info);
@@ -178,38 +192,75 @@ export function registerWorkflowComposeTools(server: McpServer): void {
           };
         }
 
-        // For large result sets, return just names + descriptions
-        if (entries.length > 20) {
-          const summary = entries.map(([name, def]) => ({
-            name,
-            display_name: def.display_name,
-            category: def.category,
-            description: def.description || "",
-          }));
+        // VERBOSE: full JSON (may be huge — only for explicit single-node deep dives).
+        if (verbose) {
+          if (entries.length > 5) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text:
+                    `verbose=true matched ${entries.length} nodes — refusing to dump that much. ` +
+                    `Narrow node_type to <=5 matches, or set verbose=false for a summary.`,
+                },
+              ],
+            };
+          }
+          const result = Object.fromEntries(entries);
           return {
             content: [
-              {
-                type: "text",
-                text: JSON.stringify(
-                  {
-                    count: summary.length,
-                    nodes: summary,
-                    hint: "Use a more specific node_type filter to see full definitions with inputs/outputs",
-                  },
-                  null,
-                  2,
-                ),
-              },
+              { type: "text", text: JSON.stringify(result, null, 2) },
             ],
           };
         }
 
-        const result = Object.fromEntries(entries);
+        // Default: structural summary — names of inputs/outputs, no dropdown values.
+        const summary = entries.map(([name, def]) => {
+          const inputTypes = def.input?.required ?? {};
+          const inputTypesOpt = def.input?.optional ?? {};
+          const summariseInputs = (obj: Record<string, unknown>) =>
+            Object.fromEntries(
+              Object.entries(obj).map(([inputName, spec]) => {
+                // spec is typically [typeOrEnum, options?] — we keep only the type tag,
+                // dropping the enum value list which is what makes Loader nodes huge.
+                if (Array.isArray(spec)) {
+                  const first = spec[0];
+                  if (Array.isArray(first)) {
+                    return [inputName, `enum(${first.length} values)`];
+                  }
+                  return [inputName, String(first)];
+                }
+                return [inputName, typeof spec];
+              }),
+            );
+          return {
+            name,
+            display_name: def.display_name,
+            category: def.category,
+            description: def.description || "",
+            input_required: summariseInputs(inputTypes as Record<string, unknown>),
+            input_optional: summariseInputs(inputTypesOpt as Record<string, unknown>),
+            output_types: def.output ?? [],
+            output_names: def.output_name ?? [],
+          };
+        });
+
         return {
           content: [
             {
               type: "text",
-              text: JSON.stringify(result, null, 2),
+              text: JSON.stringify(
+                {
+                  count: summary.length,
+                  nodes: summary,
+                  hint:
+                    entries.length === 1
+                      ? "Pass verbose=true to get the full definition with model dropdown values for this single node."
+                      : "Filter with node_type to narrow results. Pass verbose=true on a single node match for full dropdowns.",
+                },
+                null,
+                2,
+              ),
             },
           ],
         };
