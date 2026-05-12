@@ -1,3 +1,6 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { Client } from "@stable-canvas/comfyui-client";
 import { config, getComfyUIApiHost } from "../config.js";
 import { logger } from "../utils/logger.js";
@@ -5,6 +8,46 @@ import { ConnectionError } from "../utils/errors.js";
 import type { ObjectInfo, SystemStats, QueueStatus } from "./types.js";
 
 let clientInstance: Client | null = null;
+
+// ── Comfy.org API key for Partner Nodes (Seedream, Seedance, GPT-image, Veo, Kling).
+//    Without this, any workflow using Partner Nodes fails server-side with
+//    "Unauthorized: Please login first to use this node." (browser session auth
+//    does NOT propagate to external API requests).
+//
+//    Pattern discovered 2026-05-12: the ComfyUI frontend embeds the key in
+//    `extra_data.api_key_comfy_org` of the POST /prompt payload, and the
+//    executor populates the `API_KEY_COMFY_ORG` hidden input from there.
+//    See ComfyUI/comfy_api/latest/_io.py:1334-1337.
+//
+//    Resolution order: COMFY_API_KEY env var → ~/.comfy-api-key (chmod 600).
+//    Cached after first call. Safe to always include — non-Partner workflows ignore it.
+let cachedApiKey: string | null | undefined = undefined;
+
+export function loadComfyApiKey(): string | null {
+  if (cachedApiKey !== undefined) return cachedApiKey;
+  const env = process.env.COMFY_API_KEY;
+  if (env && env.trim()) {
+    cachedApiKey = env.trim();
+    logger.info("Comfy.org API key loaded from COMFY_API_KEY env var");
+    return cachedApiKey;
+  }
+  const homeKeyPath = path.join(os.homedir(), ".comfy-api-key");
+  try {
+    if (fs.existsSync(homeKeyPath)) {
+      cachedApiKey = fs.readFileSync(homeKeyPath, "utf-8").trim();
+      logger.info("Comfy.org API key loaded from ~/.comfy-api-key");
+      return cachedApiKey;
+    }
+  } catch {
+    // ignore filesystem errors — fall through to null
+  }
+  logger.warn(
+    "No Comfy.org API key found (checked COMFY_API_KEY env var and ~/.comfy-api-key). " +
+      "Partner Nodes (Seedream/Seedance/GPT-image/Veo/Kling) will fail Unauthorized.",
+  );
+  cachedApiKey = null;
+  return null;
+}
 
 export function getClient(): Client {
   if (!clientInstance) {
@@ -95,12 +138,38 @@ export async function interrupt(promptId?: string): Promise<void> {
 /**
  * Fire-and-forget: enqueue a prompt via HTTP POST (no WebSocket needed).
  * Returns prompt_id and queue position immediately.
+ *
+ * We do the POST manually instead of calling client._enqueue_prompt because
+ * we need to inject `extra_data.api_key_comfy_org` to authenticate Partner Nodes.
+ * See loadComfyApiKey() docstring.
  */
 export async function enqueuePrompt(
   workflow: Record<string, unknown>,
 ): Promise<{ prompt_id: string; queue_remaining?: number }> {
   const client = getClient();
-  const result = await client._enqueue_prompt(workflow);
+  const apiKey = loadComfyApiKey();
+
+  const payload: Record<string, unknown> = {
+    prompt: workflow,
+    client_id: "comfyui-mcp",
+  };
+  if (apiKey) {
+    payload.extra_data = { api_key_comfy_org: apiKey };
+  }
+
+  const res = await client.fetchApi("/prompt", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`ComfyUI /prompt returned ${res.status}: ${text}`);
+  }
+  const result = (await res.json()) as {
+    prompt_id: string;
+    exec_info?: { queue_remaining?: number };
+  };
   return {
     prompt_id: result.prompt_id,
     queue_remaining: result.exec_info?.queue_remaining,
