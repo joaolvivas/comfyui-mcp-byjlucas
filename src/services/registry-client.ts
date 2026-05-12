@@ -92,20 +92,45 @@ export async function searchNodes(
     return score;
   };
 
-  const filtered = lowerQuery
-    ? allNodes
-        .map((n) => ({ node: n, score: matchScore(n) }))
-        .filter(({ score }) => score > 0)
-        .sort((a, b) => b.score - a.score)
-        .map(({ node }) => node)
-    : allNodes;
+  let filtered: RegistrySearchResult[];
+  let matchedExact = false;
+  if (lowerQuery) {
+    const scored = allNodes
+      .map((n) => ({ node: n, score: matchScore(n) }))
+      .filter(({ score }) => score > 0)
+      .sort((a, b) => b.score - a.score)
+      .map(({ node }) => node);
+    if (scored.length > 0) {
+      filtered = scored;
+      matchedExact = true;
+    } else {
+      // Nothing matched in the first 100 nodes. The Comfy Registry is incomplete
+      // (many canonical packs like cubiq/PuLID_ComfyUI, kijai/ComfyUI-WanVideoWrapper
+      // exist on GitHub but were never published to api.comfy.org). Fall back to
+      // returning the first page so the caller at least sees what the Registry
+      // *does* know about. Tag the response with a synthetic marker so the tool
+      // layer can prepend an explanatory note.
+      filtered = allNodes;
+      matchedExact = false;
+    }
+  } else {
+    filtered = allNodes;
+    matchedExact = true;
+  }
 
-  // Apply pagination AFTER filter
   const start = (page - 1) * limit;
   const paged = filtered.slice(start, start + limit);
   logger.info(
-    `Registry search "${query}": fetched ${allNodes.length}, matched ${filtered.length}, returning ${paged.length} (page ${page}, limit ${limit})`,
+    `Registry search "${query}": fetched ${allNodes.length}, matched ${matchedExact ? paged.length : 0}, returning ${paged.length} (page ${page}, limit ${limit}, matchedExact=${matchedExact})`,
   );
+  // Stamp the "no match, returning default browse" signal onto the array.
+  // Using a non-enumerable property so JSON serialization is unaffected.
+  if (!matchedExact && lowerQuery) {
+    Object.defineProperty(paged, "_unmatchedFallback", {
+      value: true,
+      enumerable: false,
+    });
+  }
   return paged;
 }
 

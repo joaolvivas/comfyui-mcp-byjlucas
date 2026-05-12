@@ -1,6 +1,10 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { searchNodes, getNodePackDetails } from "../services/registry-client.js";
+import {
+  searchNodes,
+  getNodePackDetails,
+  type RegistrySearchResult,
+} from "../services/registry-client.js";
 import { errorToToolResult } from "../utils/errors.js";
 
 export function registerRegistrySearchTools(server: McpServer): void {
@@ -30,16 +34,35 @@ export function registerRegistrySearchTools(server: McpServer): void {
           page: args.page,
         });
 
-        const text = results.length === 0
-          ? `No custom nodes found for "${args.query}".`
-          : results
-              .map(
-                (r, i) =>
-                  `${i + 1}. **${r.name}** (${r.id})\n` +
-                  `   ${r.description ?? "No description"}\n` +
-                  `   Author: ${r.author} | Installs: ${r.total_install ?? "N/A"} | Version: ${r.latest_version ?? "N/A"}`,
-              )
-              .join("\n\n");
+        if (results.length === 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `No custom nodes found for "${args.query}" in the Comfy Registry.\n\nNote: the Registry is incomplete — many canonical packs (e.g. cubiq/PuLID_ComfyUI, kijai/ComfyUI-WanVideoWrapper) exist on GitHub but were never published to api.comfy.org. For those, search GitHub directly.`,
+              },
+            ],
+          };
+        }
+
+        const unmatchedFallback = (results as RegistrySearchResult[] & {
+          _unmatchedFallback?: boolean;
+        })._unmatchedFallback;
+
+        const prefix = unmatchedFallback
+          ? `⚠️ No Registry node matched "${args.query}". The Comfy Registry is incomplete — many canonical packs (e.g. cubiq/PuLID_ComfyUI, kijai/ComfyUI-WanVideoWrapper) exist on GitHub but were never published to api.comfy.org.\n\nShowing the Registry's default browse list as a fallback:\n\n`
+          : "";
+
+        const text =
+          prefix +
+          results
+            .map(
+              (r, i) =>
+                `${i + 1}. **${r.name}** (${r.id})\n` +
+                `   ${r.description ?? "No description"}\n` +
+                `   Author: ${r.author} | Installs: ${r.total_install ?? "N/A"} | Version: ${r.latest_version ?? "N/A"}`,
+            )
+            .join("\n\n");
 
         return { content: [{ type: "text", text }] };
       } catch (err) {
