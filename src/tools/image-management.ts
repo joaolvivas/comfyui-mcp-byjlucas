@@ -76,12 +76,15 @@ export function registerImageManagementTools(server: McpServer): void {
   );
 
   // ── upload_image ─────────────────────────────────────────────────────────
-  // Tries HTTP upload first (works remote), falls back to filesystem copy.
+  // HTTP-only. Previous filesystem fallback was deceptive when COMFYUI_PATH
+  // auto-detected an unrelated local install (e.g. ~/ComfyUI) — file would
+  // be copied there and tool reported success while the actual (remote)
+  // ComfyUI never received it.
   server.tool(
     "upload_image",
-    "Upload a local image file to ComfyUI's input/ directory so it can be " +
-      "referenced in LoadImage nodes. Tries HTTP upload first (works with " +
-      "remote ComfyUI), falls back to filesystem copy when COMFYUI_PATH is set.",
+    "Upload a local image file to ComfyUI's input/ directory via the HTTP " +
+      "/upload/image endpoint so it can be referenced in LoadImage nodes. " +
+      "Works with both local and remote ComfyUI instances.",
     {
       source_path: z
         .string()
@@ -96,43 +99,28 @@ export function registerImageManagementTools(server: McpServer): void {
     },
     async (args) => {
       try {
-        // Try HTTP upload first (works for remote ComfyUI)
         const result = await uploadImageAuto(args.source_path, args.filename);
         return {
           content: [
             {
               type: "text" as const,
               text:
-                `Image uploaded successfully via HTTP.\n\n` +
+                `Image uploaded successfully via HTTP to ComfyUI input/.\n\n` +
                 `Filename: ${result.filename}\n\n` +
                 `Use "${result.filename}" as the \`image\` input in LoadImage nodes.`,
             },
           ],
         };
       } catch (httpErr) {
-        // Fall back to filesystem copy if HTTP fails and COMFYUI_PATH is set
-        try {
-          const result = await uploadImage(args.source_path, args.filename);
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text:
-                  `Image uploaded successfully via filesystem.\n\n` +
-                  `Filename: ${result.filename}\nPath: ${result.path}\n\n` +
-                  `Use "${result.filename}" as the \`image\` input in LoadImage nodes.`,
-              },
-            ],
-          };
-        } catch (fsErr) {
-          // Both failed — report both errors
-          return errorToToolResult(
-            new Error(
-              `HTTP upload failed: ${httpErr instanceof Error ? httpErr.message : httpErr}\n` +
-                `Filesystem fallback also failed: ${fsErr instanceof Error ? fsErr.message : fsErr}`,
-            ),
-          );
-        }
+        return errorToToolResult(
+          new Error(
+            `HTTP upload to ComfyUI /upload/image failed: ${
+              httpErr instanceof Error ? httpErr.message : httpErr
+            }.\n` +
+              `Check COMFYUI_HOST/COMFYUI_PORT/COMFYUI_SSL config and that ComfyUI ` +
+              `is reachable (try GET /system_stats from this host).`,
+          ),
+        );
       }
     },
   );
