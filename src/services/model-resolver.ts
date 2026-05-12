@@ -6,6 +6,7 @@ import { join, basename } from "node:path";
 import { config } from "../config.js";
 import { ModelError } from "../utils/errors.js";
 import { logger } from "../utils/logger.js";
+import { getClient } from "../comfyui/client.js";
 
 export const MODEL_SUBDIRS = [
   "checkpoints",
@@ -96,23 +97,55 @@ export async function searchHuggingFaceModels(
 export async function listLocalModels(
   modelType?: string,
 ): Promise<LocalModel[]> {
-  const modelsRoot = getModelsRoot();
   const dirsToScan: string[] = modelType
     ? [modelType]
     : [...MODEL_SUBDIRS];
 
   const results: LocalModel[] = [];
 
+  // Path 1: HTTP REST (works with remote ComfyUI; respects extra_model_paths.yaml).
+  // This is the source of truth — ComfyUI's /models endpoint reports what is
+  // actually available to workflows, including symlinked/mounted dirs from
+  // extra_model_paths.yaml. Filesystem scanning of the install dir misses those.
+  try {
+    const client = getClient();
+    for (const dir of dirsToScan) {
+      try {
+        const res = await client.fetchApi(`/models/${dir}`);
+        if (!res.ok) continue;
+        const files = (await res.json()) as unknown;
+        if (!Array.isArray(files)) continue;
+        for (const name of files) {
+          if (typeof name !== "string") continue;
+          results.push({
+            name,
+            path: `${dir}/${name}`, // ComfyUI-relative (full path unknown via REST)
+            size: 0,
+            modified: "",
+            type: dir,
+          });
+        }
+      } catch (err) {
+        logger.debug(`HTTP /models/${dir} failed, continuing`, { err });
+      }
+    }
+    if (results.length > 0) return results;
+  } catch (err) {
+    logger.debug("HTTP model listing unavailable, falling back to filesystem", { err });
+  }
+
+  // Path 2: filesystem fallback. Only when COMFYUI_PATH is set AND models actually
+  // live under that path (no extra_model_paths.yaml indirection).
+  if (!config.comfyuiPath) return results;
+  const modelsRoot = join(config.comfyuiPath, "models");
   for (const dir of dirsToScan) {
     const dirPath = join(modelsRoot, dir);
     let entries: string[];
     try {
       entries = await readdir(dirPath, { recursive: true });
     } catch {
-      // Directory doesn't exist -- skip silently
       continue;
     }
-
     for (const entry of entries) {
       const filePath = join(dirPath, entry);
       try {
@@ -125,12 +158,9 @@ export async function listLocalModels(
           modified: info.mtime.toISOString(),
           type: dir,
         });
-      } catch {
-        // Skip files we can't stat
-      }
+      } catch {}
     }
   }
-
   return results;
 }
 
